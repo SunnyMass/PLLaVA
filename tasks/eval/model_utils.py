@@ -4,10 +4,12 @@ import os
 from peft import get_peft_model, LoraConfig, TaskType
 from safetensors import safe_open
 from peft import PeftModel
-from tasks.eval.eval_utils import Conversation
-from models.pllava import PllavaProcessor, PllavaForConditionalGeneration, PllavaConfig
+from PLLaVA.tasks.eval.eval_utils import Conversation
+from PLLaVA.models.pllava import PllavaProcessor, PllavaForConditionalGeneration, PllavaConfig
 from accelerate import init_empty_weights, dispatch_model, infer_auto_device_map,load_checkpoint_in_model
 from accelerate.utils import get_balanced_memory
+from transformers import AutoProcessor
+from transformers import LlavaProcessor  # 或你项目中的 PllavaProcessor
 
 from transformers import StoppingCriteria
 class KeywordsStoppingCriteria(StoppingCriteria):
@@ -50,12 +52,13 @@ def load_pllava(repo_id, num_frames, use_lora=False, weight_dir=None, lora_alpha
     )
     
     with torch.no_grad():
-        model = PllavaForConditionalGeneration.from_pretrained(repo_id, config=config, torch_dtype=torch.bfloat16)
-        
+        model = PllavaForConditionalGeneration.from_pretrained(repo_id, config=config, torch_dtype=torch.float16)
+        print("repo_id")
+        print(repo_id)
     try:
-        processor = PllavaProcessor.from_pretrained(repo_id)
+        PllavaProcessor.from_pretrained('/data/home/0006179156/scow/data_para_model/caption_pllava/pllava7b')
     except Exception as e:
-        processor = PllavaProcessor.from_pretrained('llava-hf/llava-1.5-7b-hf')
+        PllavaProcessor.from_pretrained('/data/home/0006179156/scow/data_para_model/caption_pllava/pllava7b')
 
     # config lora
     if use_lora and weight_dir is not None:
@@ -84,14 +87,14 @@ def load_pllava(repo_id, num_frames, use_lora=False, weight_dir=None, lora_alpha
 
         if not use_full:
             print("Loading weight from", weight_dir, "model.safetensors")
-            with safe_open(f"{weight_dir}/model.safetensors", framework="pt", device="cpu") as f:
+            with safe_open(f"{weight_dir}/model.safetensors", framework="pt", device="npu") as f:
                 for k in f.keys():
                     state_dict[k] = f.get_tensor(k)
         else:
             print("Loading weight from", weight_dir)
             for fn in save_fnames:
                 if fn.startswith('model-0'):
-                    with safe_open(f"{weight_dir}/{fn}", framework="pt", device="cpu") as f:
+                    with safe_open(f"{weight_dir}/{fn}", framework="pt", device="npu") as f:
                         for k in f.keys():
                             state_dict[k] = f.get_tensor(k)
             
@@ -106,7 +109,7 @@ def load_pllava(repo_id, num_frames, use_lora=False, weight_dir=None, lora_alpha
             model,
             max_memory=None,
             no_split_module_classes=["LlamaDecoderLayer"],
-            dtype='bfloat16',
+            dtype='float16',
             low_zero=False,
         )
 
@@ -114,13 +117,16 @@ def load_pllava(repo_id, num_frames, use_lora=False, weight_dir=None, lora_alpha
             model,
             max_memory=max_memory,
             no_split_module_classes=["LlamaDecoderLayer"],
-            dtype='bfloat16'
+            dtype='float16'
         )
 
         dispatch_model(model, device_map=device_map)
         print(model.hf_device_map)
 
     model = model.eval()
+    # processor = AutoProcessor.from_pretrained(repo_id)  # 这一行必须加
+    # 改成下面这一行
+    processor = PllavaProcessor.from_pretrained(repo_id)
 
     return model, processor
 

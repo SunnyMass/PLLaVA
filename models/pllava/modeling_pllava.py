@@ -36,6 +36,7 @@ import einops
 
 from .configuration_pllava import PllavaConfig
 import pickle
+import torch.nn.functional as F
 
 logger = logging.get_logger(__name__)
 
@@ -90,61 +91,327 @@ class PllavaCausalLMOutputWithPast(ModelOutput):
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     image_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
-
 class PllavaMultiModalProjector(nn.Module):
-    supported_highres = ['pad_crop_four', 'slide', ]
-    def __init__(self, config: PllavaConfig):
-        super().__init__()  
+    supported_highres = ['pad_crop_four', 'slide']
+
+    def __init__(self, config):
+        super().__init__()
         self.use_pooling = config.use_pooling
-        self.frame_shape=config.frame_shape
+        self.frame_shape = config.frame_shape
         self.num_frames = config.num_frames
         self.pooling_shape = config.pooling_shape
-        
-        self.pooling = nn.AdaptiveAvgPool3d(config.pooling_shape)
+
         self.linear_1 = nn.Linear(config.vision_config.hidden_size, config.text_config.hidden_size, bias=True)
         self.act = ACT2FN[config.projector_hidden_act]
         self.linear_2 = nn.Linear(config.text_config.hidden_size, config.text_config.hidden_size, bias=True)
 
     def convert_Fembeddings2video(self, input, num_videos, frame_shape):
-        input = einops.rearrange(input, 
-                                '(num_videos num_frames) (h w) embed_dims -> num_videos embed_dims num_frames h w', 
-                                num_videos=num_videos, h=frame_shape[0])
-        return input
-    
-    def convert_video2Fembeddings(self, input):
-        input = einops.rearrange(input, 'num_videos embed_dims num_frames h w -> (num_videos num_frames) (h w) embed_dims ', )
-        return input
+        return einops.rearrange(
+            input,
+            '(num_videos num_frames) (h w) embed_dims -> num_videos embed_dims num_frames h w',
+            num_videos=num_videos,
+            h=frame_shape[0]
+        )
 
-    def convert_video2MMembeddings(self, input):
-        input = einops.rearrange(input, 'num_videos embed_dims num_frames h w -> num_videos (num_frames h w) embed_dims ', )
-        return input
+    def adaptive_avg_pool3d_manual(self, x, output_size):
+        """
+        x: [B, C, D, H, W]
+        output_size: (d_out, h_out, w_out)
+        替代 AdaptiveAvgPool3d，NPU 兼容
+        """
+        B, C, D, H, W = x.shape
+        d_out, h_out, w_out = output_size
+
+        assert D % d_out == 0 and H % h_out == 0 and W % w_out == 0, "Input size must be divisible by output size"
+
+        kd = D // d_out
+        kh = H // h_out
+        kw = W // w_out
+
+        # reshape 成 6维：将 D/H/W 分成 avg block 块 + 块内元素
+        x = x.view(B, C, d_out, kd, h_out, kh, w_out, kw)  # [B, C, d_out, kd, h_out, kh, w_out, kw]
+        x = x.mean(dim=(3, 5, 7))  # 对 kd, kh, kw 三个维度做均值
+        return x  # shape [B, C, d_out, h_out, w_out]
+
 
     def forward(self, image_features, media_type, batch_size=None, num_videos=None):
         frame_shape = self.frame_shape
         num_frames = self.num_frames
-        assert media_type in ( 'video', 'image'), f'only image or video, but got media_type {media_type}'
         hidden_states = image_features
 
         if media_type == 'image':
             hidden_states = hidden_states.repeat(num_frames, 1, 1)
 
         total_frames, spatial_seqlen, embed_dims = hidden_states.shape
-        #TODO: temporal code, should ensure num_frames == total frames in data loading later
-        if total_frames < num_frames and self.use_pooling: # 
-            multiplier = int(num_frames/total_frames)+1
-            hidden_states= hidden_states.repeat_interleave(multiplier, dim=0)[:num_frames]
-            total_frames, spatial_seqlen, embed_dims = hidden_states.shape
+        if total_frames < num_frames and self.use_pooling:
+            multiplier = int(num_frames / total_frames) + 1
+            hidden_states = hidden_states.repeat_interleave(multiplier, dim=0)[:num_frames]
 
-        assert total_frames % num_frames == 0
         assert frame_shape[0] * frame_shape[1] == spatial_seqlen
+
         hidden_states = self.linear_1(hidden_states)
         hidden_states = self.act(hidden_states)
         hidden_states = self.linear_2(hidden_states)
-        hidden_states_videos = self.convert_Fembeddings2video(hidden_states, num_videos * batch_size, frame_shape)
-        hidden_states_videos = self.pooling(hidden_states_videos)
-        hidden_states = einops.rearrange(hidden_states_videos, 'batch_size_num_videos embed_dims num_frames h w -> batch_size_num_videos num_frames (h w) embed_dims', )
-        hidden_states = einops.rearrange(hidden_states, 'batch_size_num_videos num_frames hw embed_dims -> batch_size_num_videos (num_frames hw) embed_dims ')
+
+        B = batch_size * num_videos
+        hidden_states_videos = self.convert_Fembeddings2video(hidden_states, B, frame_shape)
+
+        #torch.set_printoptions(threshold=float('inf')); open("hidden_states_videos.txt", "w").write(str(hidden_states_videos.cpu()))
+        # with open("hidden_states_videos.txt", "w") as f:
+        #     for val in hidden_states_videos.flatten().cpu():
+        #         f.write(f"{val.item():.4f}\\n")
+        # ⛔ 替代 AdaptiveAvgPool3d
+        print("hidden_states_videos1")
+        print(hidden_states_videos.shape)
+        hidden_states_videos = self.adaptive_avg_pool3d_manual(hidden_states_videos, self.pooling_shape)
+        print("hidden_states_videos2")
+        print(hidden_states_videos.shape)
+        hidden_states = einops.rearrange(hidden_states_videos, 'b c t h w -> b t (h w) c')
+        hidden_states = einops.rearrange(hidden_states, 'b t hw c -> b (t hw) c')
+
         return hidden_states
+# class PllavaMultiModalProjector(nn.Module):
+#     supported_highres = ['pad_crop_four', 'slide']
+
+#     def __init__(self, config):
+#         super().__init__()
+#         self.use_pooling = config.use_pooling
+#         self.frame_shape = config.frame_shape
+#         self.num_frames = config.num_frames
+#         self.pooling_shape = config.pooling_shape  # e.g. (1, 1, 1) or (4, 4, 4)
+
+#         self.linear_1 = nn.Linear(config.vision_config.hidden_size, config.text_config.hidden_size, bias=True)
+#         self.act = ACT2FN[config.projector_hidden_act]
+#         self.linear_2 = nn.Linear(config.text_config.hidden_size, config.text_config.hidden_size, bias=True)
+
+#     def convert_Fembeddings2video(self, input, num_videos, frame_shape):
+#         return einops.rearrange(
+#             input,
+#             '(num_videos num_frames) (h w) embed_dims -> num_videos embed_dims num_frames h w',
+#             num_videos=num_videos,
+#             h=frame_shape[0]
+#         )
+
+#     def forward(self, image_features, media_type, batch_size=None, num_videos=None):
+#         frame_shape = self.frame_shape
+#         num_frames = self.num_frames
+#         hidden_states = image_features
+
+#         if media_type == 'image':
+#             hidden_states = hidden_states.repeat(num_frames, 1, 1)
+
+#         total_frames, spatial_seqlen, embed_dims = hidden_states.shape
+
+#         if total_frames < num_frames and self.use_pooling:
+#             multiplier = int(num_frames / total_frames) + 1
+#             hidden_states = hidden_states.repeat_interleave(multiplier, dim=0)[:num_frames]
+
+#         assert frame_shape[0] * frame_shape[1] == spatial_seqlen
+
+#         hidden_states = self.linear_1(hidden_states)
+#         hidden_states = self.act(hidden_states)
+#         hidden_states = self.linear_2(hidden_states)
+
+#         B = batch_size * num_videos
+#         C = hidden_states.shape[-1]
+#         D = num_frames
+#         H, W = frame_shape
+
+#         # (B, C, D, H, W)
+#         hidden_states_videos = self.convert_Fembeddings2video(hidden_states, B, frame_shape)
+
+#         # ⚠️ 替代 AdaptiveAvgPool3d：使用 avg_pool3d
+#         kd, kh, kw = self.pooling_shape
+#         sd, sh, sw = D // kd, H // kh, W // kw
+#         hidden_states_videos = F.avg_pool3d(
+#             hidden_states_videos,
+#             kernel_size=(sd, sh, sw),
+#             stride=(sd, sh, sw),
+#             ceil_mode=False
+#         )
+
+#         # (B, C, kd, kh, kw) → (B, kd, kh*kw, C) → (B, kd*kh*kw, C)
+#         hidden_states = einops.rearrange(hidden_states_videos, 'b c t h w -> b t (h w) c')
+#         hidden_states = einops.rearrange(hidden_states, 'b t hw c -> b (t hw) c')
+
+#         return hidden_states
+# class PllavaMultiModalProjector(nn.Module):
+#     supported_highres = ['pad_crop_four', 'slide', ]
+#     def __init__(self, config: PllavaConfig):
+#         super().__init__()  
+#         self.use_pooling = config.use_pooling
+#         self.frame_shape=config.frame_shape
+#         self.num_frames = config.num_frames
+#         self.pooling_shape = config.pooling_shape
+        
+#         self.pooling = nn.AdaptiveAvgPool3d(config.pooling_shape)
+#         self.linear_1 = nn.Linear(config.vision_config.hidden_size, config.text_config.hidden_size, bias=True)
+#         self.act = ACT2FN[config.projector_hidden_act]
+#         self.linear_2 = nn.Linear(config.text_config.hidden_size, config.text_config.hidden_size, bias=True)
+
+#     def convert_Fembeddings2video(self, input, num_videos, frame_shape):
+#         input = einops.rearrange(input, 
+#                                 '(num_videos num_frames) (h w) embed_dims -> num_videos embed_dims num_frames h w', 
+#                                 num_videos=num_videos, h=frame_shape[0])
+#         return input
+    
+#     def convert_video2Fembeddings(self, input):
+#         input = einops.rearrange(input, 'num_videos embed_dims num_frames h w -> (num_videos num_frames) (h w) embed_dims ', )
+#         return input
+
+#     def convert_video2MMembeddings(self, input):
+#         input = einops.rearrange(input, 'num_videos embed_dims num_frames h w -> num_videos (num_frames h w) embed_dims ', )
+#         return input
+
+#     def forward(self, image_features, media_type, batch_size=None, num_videos=None):
+#         frame_shape = self.frame_shape
+#         num_frames = self.num_frames
+#         assert media_type in ( 'video', 'image'), f'only image or video, but got media_type {media_type}'
+#         hidden_states = image_features
+
+#         if media_type == 'image':
+#             hidden_states = hidden_states.repeat(num_frames, 1, 1)
+
+#         total_frames, spatial_seqlen, embed_dims = hidden_states.shape
+#         #TODO: temporal code, should ensure num_frames == total frames in data loading later
+#         if total_frames < num_frames and self.use_pooling: # 
+#             multiplier = int(num_frames/total_frames)+1
+#             hidden_states= hidden_states.repeat_interleave(multiplier, dim=0)[:num_frames]
+#             total_frames, spatial_seqlen, embed_dims = hidden_states.shape
+
+#         assert total_frames % num_frames == 0
+#         assert frame_shape[0] * frame_shape[1] == spatial_seqlen
+#         hidden_states = self.linear_1(hidden_states)
+#         hidden_states = self.act(hidden_states)
+#         hidden_states = self.linear_2(hidden_states)
+#         hidden_states_videos = self.convert_Fembeddings2video(hidden_states, num_videos * batch_size, frame_shape)
+#         print("hidden_states_videos.shape", hidden_states_videos.shape)
+#         hidden_states_videos = self.pooling(hidden_states_videos)
+#         hidden_states = einops.rearrange(hidden_states_videos, 'batch_size_num_videos embed_dims num_frames h w -> batch_size_num_videos num_frames (h w) embed_dims', )
+#         hidden_states = einops.rearrange(hidden_states, 'batch_size_num_videos num_frames hw embed_dims -> batch_size_num_videos (num_frames hw) embed_dims ')
+#         return hidden_states
+# class PllavaMultiModalProjector(nn.Module):
+#     supported_highres = ['pad_crop_four', 'slide']
+
+#     def __init__(self, config: PllavaConfig):
+#         super().__init__()
+#         self.use_pooling = config.use_pooling
+#         self.frame_shape = config.frame_shape
+#         self.num_frames = config.num_frames
+#         self.pooling_shape = config.pooling_shape
+
+#         # Replace 3D pooling with 2D pooling for compatibility
+#         self.pooling = nn.AdaptiveAvgPool2d((1, 1))
+#         self.linear_1 = nn.Linear(config.vision_config.hidden_size, config.text_config.hidden_size, bias=True)
+#         self.act = ACT2FN[config.projector_hidden_act]
+#         self.linear_2 = nn.Linear(config.text_config.hidden_size, config.text_config.hidden_size, bias=True)
+
+#     def convert_Fembeddings2video(self, input, num_videos, frame_shape):
+#         input = einops.rearrange(
+#             input,
+#             '(num_videos num_frames) (h w) embed_dims -> num_videos embed_dims num_frames h w',
+#             num_videos=num_videos,
+#             h=frame_shape[0]
+#         )
+#         return input
+
+#     def forward(self, image_features, media_type, batch_size=None, num_videos=None):
+#         frame_shape = self.frame_shape
+#         num_frames = self.num_frames
+#         assert media_type in ('video', 'image'), f'only image or video, but got media_type {media_type}'
+#         hidden_states = image_features
+
+#         if media_type == 'image':
+#             hidden_states = hidden_states.repeat(num_frames, 1, 1)
+
+#         total_frames, spatial_seqlen, embed_dims = hidden_states.shape
+#         if total_frames < num_frames and self.use_pooling:
+#             multiplier = int(num_frames / total_frames) + 1
+#             hidden_states = hidden_states.repeat_interleave(multiplier, dim=0)[:num_frames]
+#             total_frames, spatial_seqlen, embed_dims = hidden_states.shape
+
+#         assert total_frames % num_frames == 0
+#         assert frame_shape[0] * frame_shape[1] == spatial_seqlen
+
+#         hidden_states = self.linear_1(hidden_states)
+#         hidden_states = self.act(hidden_states)
+#         hidden_states = self.linear_2(hidden_states)
+
+#         B = batch_size * num_videos
+#         C = hidden_states.shape[-1]
+#         D = num_frames
+#         H, W = frame_shape
+
+#         hidden_states_videos = self.convert_Fembeddings2video(hidden_states, B, frame_shape)  # [B, C, D, H, W]
+#         print("hidden_states_videos.shape", hidden_states_videos.shape)
+
+#         # # Convert to [B*D, C, H, W] for 2D pooling
+#         # hidden_states_videos = hidden_states_videos.permute(0, 2, 1, 3, 4).contiguous()
+#         # hidden_states_videos = hidden_states_videos.view(B * D, C, H, W)
+#         # pooled = self.pooling(hidden_states_videos)  # -> [B*D, C, 1, 1]
+#         # pooled = pooled.view(B, D, C)  # -> [B, D, C]
+#         # 等价于对 D、H、W 三个维度平均
+#         hidden_states_videos = self.convert_Fembeddings2video(hidden_states, B, frame_shape)  # [B, C, D, H, W]
+#         pooled = hidden_states_videos.mean(dim=2)  # 先对 D（时间）维做均值，得到 [B, C, H, W]
+#         pooled = self.pooling(pooled)  # AdaptiveAvgPool2d((1, 1)) → [B, C, 1, 1]
+#         pooled = pooled.view(B, 1, C)  # [B, 1, C]
+
+#         return pooled
+
+# class PllavaMultiModalProjector(nn.Module):
+#     supported_highres = ['pad_crop_four', 'slide']
+
+#     def __init__(self, config: PllavaConfig):
+#         super().__init__()
+#         self.use_pooling = config.use_pooling
+#         self.frame_shape = config.frame_shape
+#         self.num_frames = config.num_frames
+#         self.linear_1 = nn.Linear(config.vision_config.hidden_size, config.text_config.hidden_size, bias=True)
+#         self.act = ACT2FN[config.projector_hidden_act]
+#         self.linear_2 = nn.Linear(config.text_config.hidden_size, config.text_config.hidden_size, bias=True)
+
+#     def convert_Fembeddings2video(self, input, num_videos, frame_shape):
+#         return einops.rearrange(
+#             input,
+#             '(num_videos num_frames) (h w) embed_dims -> num_videos embed_dims num_frames h w',
+#             num_videos=num_videos,
+#             h=frame_shape[0]
+#         )
+
+#     def forward(self, image_features, media_type, batch_size=None, num_videos=None):
+#         frame_shape = self.frame_shape
+#         num_frames = self.num_frames
+#         hidden_states = image_features
+
+#         if media_type == 'image':
+#             hidden_states = hidden_states.repeat(num_frames, 1, 1)
+
+#         total_frames, spatial_seqlen, embed_dims = hidden_states.shape
+#         if total_frames < num_frames and self.use_pooling:
+#             multiplier = int(num_frames / total_frames) + 1
+#             hidden_states = hidden_states.repeat_interleave(multiplier, dim=0)[:num_frames]
+
+#         assert frame_shape[0] * frame_shape[1] == spatial_seqlen
+#         hidden_states = self.linear_1(hidden_states)
+#         hidden_states = self.act(hidden_states)
+#         hidden_states = self.linear_2(hidden_states)
+
+#         B = batch_size * num_videos
+#         C = hidden_states.shape[-1]
+#         D = num_frames
+#         H, W = frame_shape
+
+#         # [B, C, D, H, W]
+#         hidden_states_videos = self.convert_Fembeddings2video(hidden_states, B, frame_shape)
+
+#         # ⛔️不要用 AdaptiveAvgPool3d，改成直接 mean
+#         # [B, C, D, H, W] -> [B, D, C]
+#         pooled = hidden_states_videos.mean(dim=[3, 4])  # mean over H, W
+#         pooled = pooled.permute(0, 2, 1)  # -> [B, C, D]
+#         pooled = pooled.reshape(B, D, C)  # -> [B, D, C]
+
+#         # 模拟原始 2D patch 展平行为：[B, D, C] -> [B, D*1, C]
+#         return pooled.reshape(B, D, 1, C).squeeze(2)  # -> [B, D, C]
 
 
 
@@ -291,7 +558,8 @@ class PllavaForConditionalGeneration(PllavaPreTrainedModel):
         self.vision_tower = AutoModel.from_config(config.vision_config)
         self.multi_modal_projector = PllavaMultiModalProjector(config)
         self.vocab_size = config.vocab_size
-        self.language_model = AutoModelForCausalLM.from_config(config.text_config, torch_dtype=config.torch_dtype, attn_implementation="flash_attention_2")
+        # flash_attention_2
+        self.language_model = AutoModelForCausalLM.from_config(config.text_config, torch_dtype=config.torch_dtype, attn_implementation=None)
         self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else self.config.text_config.pad_token_id
         assert self.pad_token_id is not None, 'provide the model with pad_token_id, this would be used to arranging new embedings'
         self.post_init()

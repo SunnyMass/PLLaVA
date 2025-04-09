@@ -68,7 +68,7 @@ class PllavaProcessor(ProcessorMixin):
         self.center_pad = center_pad
         super().__init__(image_processor, tokenizer)
 
-    def resize_crop_longshort(self, videos: list[list[np.ndarray]], input_data_format):
+    def resize_crop_longshort(self, videos: List[List[np.ndarray]], input_data_format):
         video_spatial_sizes = [get_image_size(images[0], input_data_format) for images in videos]
         long_short_rates = [max(size) / min(size) for size in video_spatial_sizes]
         min_long_short_rate = min(long_short_rates)
